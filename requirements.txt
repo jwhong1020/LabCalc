@@ -2,3 +2,4 @@ streamlit
 pandas
 sqlalchemy
 openpyxl
+psycopg2
