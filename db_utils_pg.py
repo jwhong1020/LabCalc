@@ -1,60 +1,196 @@
-# db_utils.py
 from __future__ import annotations
 
-import sqlite3
 import uuid
-from pathlib import Path
 from typing import Tuple, List, Dict, Any, Optional
 
+import streamlit as st
 import pandas as pd
-import psycopg2
+from psycopg2.pool import SimpleConnectionPool
+
+# =================================================
+# Connection pool (singleton)
+# =================================================
+
+_pool: Optional[SimpleConnectionPool] = None
 
 
-# ---------------- DB connection ----------------
-def get_conn():
-    return psycopg2.connect(
-        host=st.secrets["db"]["host"],
-        dbname=st.secrets["db"]["name"],
-        user=st.secrets["db"]["user"],
-        password=st.secrets["db"]["password"],
-        port=5432,
-        sslmode="require"
+def get_pool() -> SimpleConnectionPool:
+    global _pool
+    if _pool is None:
+        cfg = st.secrets["db"]
+        _pool = SimpleConnectionPool(
+            minconn=1,
+            maxconn=5,
+            host=cfg["host"],
+            port=cfg["port"],
+            dbname=cfg["name"],
+            user=cfg["user"],
+            password=cfg["password"],
+        )
+    return _pool
+
+
+# =================================================
+# Low-level DB helpers (NO conn argument)
+# =================================================
+
+def execute(sql: str, params: tuple | None = None) -> None:
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+    finally:
+        pool.putconn(conn)
+
+
+def fetchone(sql: str, params: tuple | None = None):
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchone()
+    finally:
+        pool.putconn(conn)
+
+
+def fetchall(sql: str, params: tuple | None = None):
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return cur.fetchall()
+    finally:
+        pool.putconn(conn)
+
+
+# =================================================
+# epsilon DB
+# =================================================
+
+def get_eps_db(conn=None) -> pd.DataFrame:
+    rows = fetchall(
+        "SELECT name, wavelength, epsilon, note FROM epsilon_db"
+    )
+    return pd.DataFrame(
+        rows,
+        columns=["name", "wavelength", "epsilon", "note"]
     )
 
-# ---------------- epsilon DB ----------------
-def get_eps_db(conn: sqlite3.Connection) -> pd.DataFrame:
-    return pd.read_sql("SELECT * FROM epsilon_db", conn)
 
-
-def ensure_epsilon_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
+def upsert_epsilon(
+    conn,
+    name: str,
+    wavelength: int,
+    epsilon: float,
+    note: Optional[str] = None,
+) -> None:
+    execute(
         """
-        CREATE TABLE IF NOT EXISTS epsilon_db (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            wavelength INTEGER,
-            epsilon REAL NOT NULL,
-            unit TEXT DEFAULT 'M-1cm-1',
-            note TEXT
-            )
-        """
+        INSERT INTO epsilon_db (name, wavelength, epsilon, note)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT (name, wavelength)
+        DO UPDATE SET
+            epsilon = EXCLUDED.epsilon,
+            note = EXCLUDED.note
+        """,
+        (name, wavelength, epsilon, note),
     )
 
-    # UNIQUE (name, wavelength)
-    conn.execute(
+
+def get_epsilon_value(
+    conn,
+    name: str,
+    wavelength: int
+) -> Optional[Dict[str, float]]:
+    row = fetchone(
         """
-        CREATE UNIQUE INDEX IF NOT EXISTS
-        idx_epsilon_unique
-        ON epsilon_db(name, wavelength)
+        SELECT epsilon
+        FROM epsilon_db
+        WHERE name = %s AND wavelength = %s
+        """,
+        (name, wavelength),
+    )
+    if row:
+        return {"epsilon": float(row[0])}
+    return None
+
+
+# =================================================
+# correction factor DB
+# =================================================
+
+def get_cf(
+    conn,
+    dye_name: str,
+    target_wavelength: int
+) -> Optional[float]:
+    row = fetchone(
         """
+        SELECT factor
+        FROM correction_factor_db
+        WHERE dye_name = %s AND target_wavelength = %s
+        """,
+        (dye_name, target_wavelength),
+    )
+    return float(row[0]) if row else None
+
+def upsert_cf(
+    conn,
+    dye_name: str,
+    target_wavelength: int,
+    factor: float,
+    note: Optional[str] = None,
+) -> None:
+    # 1️⃣ 먼저 UPDATE 시도
+    execute(
+        """
+        UPDATE correction_factor_db
+        SET factor = %s, note = %s
+        WHERE dye_name = %s AND target_wavelength = %s
+        """,
+        (factor, note, dye_name, target_wavelength),
     )
 
-    conn.commit()
+    # 2️⃣ 없으면 INSERT
+    execute(
+        """
+        INSERT INTO correction_factor_db (dye_name, target_wavelength, factor, note)
+        SELECT %s, %s, %s, %s
+        WHERE NOT EXISTS (
+            SELECT 1 FROM correction_factor_db
+            WHERE dye_name = %s AND target_wavelength = %s
+        )
+        """,
+        (dye_name, target_wavelength, factor, note,
+         dye_name, target_wavelength),
+    )
 
 
-# ---------------- stocks ----------------
-def load_stocks(conn: sqlite3.Connection) -> pd.DataFrame:
-    return pd.read_sql_query(
+
+def get_cf_db(conn=None) -> pd.DataFrame:
+    rows = fetchall(
+        """
+        SELECT dye_name, target_wavelength, factor, note
+        FROM correction_factor_db
+        ORDER BY dye_name, target_wavelength
+        """
+    )
+    return pd.DataFrame(
+        rows,
+        columns=["dye_name", "target_wavelength", "factor", "note"]
+    )
+
+
+# =================================================
+# stocks
+# =================================================
+
+def load_stocks(conn=None) -> pd.DataFrame:
+    rows = fetchall(
         """
         SELECT
             id, name,
@@ -62,38 +198,44 @@ def load_stocks(conn: sqlite3.Connection) -> pd.DataFrame:
             notes, created_at
         FROM stocks
         ORDER BY name
-        """,
-        conn,
+        """
+    )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "id", "name",
+            "stock_conc", "stock_unit",
+            "notes", "created_at",
+        ],
     )
 
 
 def insert_stock(
-    conn: sqlite3.Connection,
+    conn,
     stock_id: str,
     name: str,
     conc: float,
     unit: str,
     notes: Optional[str],
 ) -> None:
-    conn.execute(
+    execute(
         """
         INSERT INTO stocks(id, name, stock_conc, stock_unit, notes)
         VALUES (%s, %s, %s, %s, %s)
         """,
         (stock_id, name, float(conc), unit, notes or None),
     )
-    conn.commit()
 
 
 def update_stock(
-    conn: sqlite3.Connection,
+    conn,
     stock_id: str,
     name: str,
     conc: float,
     unit: str,
     notes: Optional[str],
 ) -> None:
-    conn.execute(
+    execute(
         """
         UPDATE stocks
         SET name = %s, stock_conc = %s, stock_unit = %s, notes = %s
@@ -101,110 +243,68 @@ def update_stock(
         """,
         (name, float(conc), unit, notes or None, stock_id),
     )
-    conn.commit()
 
 
-def delete_stock(conn: sqlite3.Connection, stock_id: str) -> None:
-    conn.execute("DELETE FROM stocks WHERE id = %s", (stock_id,))
-    conn.commit()
-
-
-# ---------------- plans ----------------
-def ensure_plans_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS plans (
-            plan_id     TEXT PRIMARY KEY,
-            title       TEXT NOT NULL,
-            category    TEXT,
-            created_by  TEXT,
-            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-            notes       TEXT
-        )
-        """
+def delete_stock(conn, stock_id: str) -> None:
+    execute(
+        "DELETE FROM stocks WHERE id = %s",
+        (stock_id,),
     )
 
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS
-        idx_reactions_plan_id
-        ON reactions(plan_id)
-        """
-    )
 
-    conn.commit()
+# =================================================
+# plans / templates
+# =================================================
 
-
-def load_plans(conn: sqlite3.Connection) -> pd.DataFrame:
-    return pd.read_sql_query(
+def load_plans(conn=None) -> pd.DataFrame:
+    rows = fetchall(
         """
         SELECT
             plan_id, title, category,
             created_by, created_at, notes
         FROM plans
         ORDER BY created_at DESC
-        """,
-        conn,
+        """
+    )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "plan_id", "title", "category",
+            "created_by", "created_at", "notes",
+        ],
     )
 
 
-# ---------------- labeling records ----------------
-def ensure_labeling_records_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS labeling_records (
-            record_id TEXT PRIMARY KEY,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            created_by TEXT,
-
-            title TEXT,
-
-            target_name TEXT,
-            target_epsilon REAL,
-            A_target REAL,
-
-            dye_name TEXT,
-            dye_epsilon REAL,
-            A_dye REAL,
-
-            target_uM REAL,
-            dye_uM REAL,
-
-            labeling_ratio REAL,
-            purity REAL,
-
-            A260 REAL,
-            A280 REAL,
-            uv_purity REAL,
-
-            note TEXT
-        )
-        """
-    )
-    conn.commit()
-
-
-# ---------------- templates ----------------
-def load_templates(conn: sqlite3.Connection) -> pd.DataFrame:
-    return pd.read_sql_query(
+def load_templates(conn):
+    rows = fetchall(
         """
         SELECT
             template_id,
             name,
             description,
-            created_at
+            final_volume,
+            final_volume_unit
         FROM templates
-        ORDER BY created_at DESC
+        ORDER BY name
         """,
-        conn,
+        ()
+    )
+
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "template_id",
+            "name",
+            "description",
+            "final_volume",
+            "final_volume_unit",
+        ],
     )
 
 
-def load_template_items(
-    conn: sqlite3.Connection,
-    template_id: str
-) -> pd.DataFrame:
-    return pd.read_sql_query(
+
+def load_template_items(conn, template_id: str) -> pd.DataFrame:
+    rows = fetchall(
         """
         SELECT
             stock_id,
@@ -219,42 +319,66 @@ def load_template_items(
         WHERE template_id = %s
         ORDER BY stock_id
         """,
-        conn,
-        params=(template_id,),
+        (template_id,),
+    )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "stock_id",
+            "example_target",
+            "example_target_unit",
+            "example_volume",
+            "example_volume_unit",
+            "example_amount",
+            "example_amount_unit",
+            "item_note",
+        ],
     )
 
 
-def delete_template(conn: sqlite3.Connection, template_id: str) -> None:
-    conn.execute(
+def delete_template(conn, template_id: str) -> None:
+    execute(
         "DELETE FROM template_items WHERE template_id = %s",
         (template_id,),
     )
-    conn.execute(
+    execute(
         "DELETE FROM templates WHERE template_id = %s",
         (template_id,),
     )
-    conn.commit()
 
 
 def update_template_meta(
-    conn: sqlite3.Connection,
-    template_id: str,
-    name: str,
-    description: Optional[str],
-) -> None:
-    conn.execute(
+    conn,
+    template_id,
+    name,
+    description,
+    final_volume=None,
+    final_volume_unit=None,
+):
+    execute(
         """
         UPDATE templates
-        SET name = %s, description = %s
+        SET
+            name = %s,
+            description = %s,
+            final_volume = COALESCE(%s, final_volume),
+            final_volume_unit = COALESCE(%s, final_volume_unit)
         WHERE template_id = %s
         """,
-        (name, description or None, template_id),
+        (
+            name,
+            description,
+            final_volume,
+            final_volume_unit,
+            template_id,
+        )
     )
-    conn.commit()
+
+
 
 
 def save_template_from_computed(
-    conn: sqlite3.Connection,
+    conn,
     tmpl_name: str,
     tmpl_desc: Optional[str],
     computed: List[Dict[str, Any]],
@@ -264,18 +388,11 @@ def save_template_from_computed(
         return False, "Template name이 필요합니다."
 
     if any(it.get("stock_id") is None for it in computed):
-        return False, "템플릿 저장은 DB stock만 가능합니다. (임시 시약 포함)"
-
-    seen = set()
-    for it in computed:
-        sid = it["stock_id"]
-        if sid in seen:
-            return False, f"같은 stock이 2번 포함됨: {sid}"
-        seen.add(sid)
+        return False, "템플릿 저장은 DB stock만 가능합니다."
 
     template_id = str(uuid.uuid4())
 
-    conn.execute(
+    execute(
         """
         INSERT INTO templates(template_id, name, description)
         VALUES (%s, %s, %s)
@@ -284,7 +401,7 @@ def save_template_from_computed(
     )
 
     for it in computed:
-        conn.execute(
+        execute(
             """
             INSERT INTO template_items (
                 template_id,
@@ -302,163 +419,14 @@ def save_template_from_computed(
             (
                 template_id,
                 it["stock_id"],
-                it["target_conc"] if it.get("target_conc", 0) > 0 else None,
-                it["target_unit"] if it.get("target_conc", 0) > 0 else None,
-                it["volume"] if it.get("volume", 0) > 0 else None,
-                it["volume_unit"] if it.get("volume", 0) > 0 else None,
+                it.get("target_conc") or None,
+                it.get("target_unit") or None,
+                it.get("volume") or None,
+                it.get("volume_unit") or None,
                 float(it.get("amount") or 0.0),
                 it.get("amount_unit") or "nmol",
                 it.get("note") or None,
             ),
         )
 
-    conn.commit()
     return True, f"Saved template: {name}"
-
-# ---------------- epsilon CRUD ----------------
-def upsert_epsilon(
-    conn: sqlite3.Connection,
-    name: str,
-    wavelength: int,
-    epsilon: float,
-    note: Optional[str] = None,
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO epsilon_db (name, wavelength, epsilon, note)
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT(name, wavelength)
-        DO UPDATE SET
-            epsilon = excluded.epsilon,
-            note = excluded.note
-        """,
-        (name, wavelength, epsilon, note),
-    )
-    conn.commit()
-
-
-# ---------------- labeling records ----------------
-def insert_labeling_record(
-    conn: sqlite3.Connection,
-    record: Dict[str, Any],
-) -> None:
-    """
-    record dict keys:
-    record_id, created_by,
-    target_name, target_epsilon, A_target,
-    dye_name, dye_epsilon, A_dye,
-    target_uM, dye_uM,
-    labeling_ratio, purity,
-    A260, A280, uv_purity,
-    note
-    """
-    conn.execute(
-        """
-        INSERT INTO labeling_records (
-            record_id, created_by,
-            target_name, target_epsilon, A_target,
-            dye_name, dye_epsilon, A_dye,
-            target_uM, dye_uM,
-            labeling_ratio, purity,
-            A260, A280, uv_purity,
-            note
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-        (
-            record["record_id"],
-            record["created_by"],
-            record["target_name"],
-            record["target_epsilon"],
-            record["A_target"],
-            record["dye_name"],
-            record["dye_epsilon"],
-            record["A_dye"],
-            record["target_uM"],
-            record["dye_uM"],
-            record["labeling_ratio"],
-            record["purity"],
-            record.get("A260"),
-            record.get("A280"),
-            record.get("uv_purity"),
-            record.get("note"),
-        ),
-    )
-    conn.commit()
-# CF와 epsilon 호출
-def get_epsilon_value(
-    conn: sqlite3.Connection,
-    name: str,
-    wavelength: int
-) -> Optional[Dict[str, float]]:
-    row = conn.execute(
-        """
-        SELECT epsilon
-        FROM epsilon_db
-        WHERE name = %s AND wavelength = %s
-
-        """,
-        (name, wavelength)
-    ).fetchone()
-
-    if row:
-        return {
-            "epsilon": float(row[0])
-        }
-    return None
-
-## Correction factor CRUD
-# ---------------- correction factor ----------------
-def get_cf(
-    conn: sqlite3.Connection,
-    dye_name: str,
-    target_wavelength: int
-) -> Optional[float]:
-    row = conn.execute(
-        """
-        SELECT factor
-        FROM correction_factor_db
-        WHERE dye_name = %s AND target_wavelength = %s
-        """,
-        (dye_name, target_wavelength)
-    ).fetchone()
-
-    return float(row[0]) if row else None
-
-
-def upsert_cf(
-    conn: sqlite3.Connection,
-    dye_name: str,
-    target_wavelength: int,
-    factor: float,
-    note: Optional[str] = None,
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO correction_factor_db (
-            dye_name, target_wavelength, factor, note
-        )
-        VALUES (%s, %s, %s, %s)
-        ON CONFLICT(dye_name, target_wavelength)
-        DO UPDATE SET
-            factor = excluded.factor,
-            note = excluded.note
-        """,
-        (dye_name, target_wavelength, factor, note),
-    )
-    conn.commit()
-
-# CF DB 로딩 함수
-def get_cf_db(conn: sqlite3.Connection) -> pd.DataFrame:
-    return pd.read_sql(
-        """
-        SELECT
-            dye_name,
-            target_wavelength,
-            factor,
-            note
-        FROM correction_factor_db
-        ORDER BY dye_name, target_wavelength
-        """,
-        conn
-    )
