@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 import uuid
 import copy
-import sqlite3
+
 from pathlib import Path
 from typing import Tuple, List, Dict, Any, Optional
 
@@ -18,6 +18,18 @@ from io import BytesIO
 
 from datetime import datetime, timedelta
 
+import psycopg2
+from db_cache import (
+    cached_load_stocks,
+    cached_load_templates,
+    cached_load_template_items,
+    cached_load_plans,
+    cached_eps_db,
+    cached_cf_db,
+    cached_reactions_in_plan,
+    cached_labeling_records
+)
+
 from utils import (
     slugify, fmt_num, auto_stock_id,
     conc_from_amount_volume,
@@ -25,31 +37,25 @@ from utils import (
     to_uL, from_uL,
     amount_nmol_from_conc_vol,
     calc_volume_uL_from_target,
-    compute_reaction
+    compute_reaction,
+    lookup_cf
 )
 
-from db_utils import (
-    get_conn,
-    get_eps_db,
-    ensure_epsilon_table,
-    ensure_labeling_records_table,
+from db_utils_pg import (
+    get_eps_db, execute,
 
     load_stocks, insert_stock, update_stock, delete_stock,
-    load_plans, ensure_plans_table,
+    load_plans, 
 
     load_templates, load_template_items, delete_template, update_template_meta,
     save_template_from_computed,
 
-    upsert_epsilon,
-    insert_labeling_record, 
+    upsert_epsilon, 
     get_epsilon_value,
     
-    get_cf, upsert_cf, get_cf_db
+    get_cf, upsert_cf, get_cf_db,
+    fetchall
 )
-
-
-DB_PATH = Path(__file__).parent / "db" / "labcalc.db"
-conn = get_conn(DB_PATH)
 
 CONC_UNITS = ["M", "mM", "uM", "nM"]
 VOL_UNITS = ["uL", "mL"]
@@ -65,37 +71,65 @@ CATEGORIES = [
 
 
 # render
-def render_template_manager(conn: sqlite3.Connection):
+def render_template_manager(conn):
     st.subheader("Template Manager")
 
-    tmpl_df = load_templates(conn)
+    tmpl_df = cached_load_templates()
+    if "creating_template" not in st.session_state:
+        st.session_state["creating_template"] = False
+    if "editing_template" not in st.session_state:
+        st.session_state["editing_template"] = False
+    if "tmpl_rows" not in st.session_state:
+        st.session_state["tmpl_rows"] = None
 
-    if tmpl_df.empty:
-        st.info("저장된 template이 없습니다.")
-        return
+    # ---- Add new template ----
+    st.markdown("### Template")
 
-    # ---- Template 선택 ----
-    sel_name = st.selectbox(
-        "Select template",
-        tmpl_df["name"].tolist()
+    tmpl_names = ["➕ New template"] + (
+        tmpl_df["name"].tolist() if not tmpl_df.empty else []
     )
 
-    row = tmpl_df[tmpl_df["name"] == sel_name].iloc[0]
-    template_id = row["template_id"]
+    sel_name = st.selectbox(
+        "Select template",
+        tmpl_names,
+        key="template_select_box"
+    )
+
+    if sel_name == "➕ New template":
+        creating = True
+        row = None
+        template_id = None
+    else:
+        creating = False
+        row = tmpl_df[tmpl_df["name"] == sel_name].iloc[0]
+        template_id = row["template_id"]
+
+    st.session_state["creating_template"] = creating
 
     st.divider()
 
     # ---- Template meta 수정 ----
     st.markdown("### Template info")
 
-    new_name = st.text_input(
-        "Template name",
-        value=row["name"]
-    )
-    new_desc = st.text_input(
-        "Description",
-        value=row.get("description") or ""
-    )
+    if st.session_state["creating_template"]:
+        new_name = st.text_input(
+            "Template name *",
+            value=st.session_state.get("new_template_name", "")
+        )
+        new_desc = st.text_input(
+            "Description",
+            value=st.session_state.get("new_template_desc", "")
+        )
+    else:
+        new_name = st.text_input(
+            "Template name",
+            value=row["name"]
+        )
+        new_desc = st.text_input(
+            "Description",
+            value=row.get("description") or ""
+        )
+
 
     col1, col2 = st.columns([1, 1])
 
@@ -104,40 +138,352 @@ def render_template_manager(conn: sqlite3.Connection):
             st.error("Template name은 비워둘 수 없습니다.")
         else:
             update_template_meta(conn, template_id, new_name.strip(), new_desc)
+            cached_load_templates.clear()
             st.success("Template info updated.")
             st.rerun()
+            
 
     if col2.button("Delete template"):
         st.warning("이 작업은 되돌릴 수 없습니다.")
-        if st.confirm("정말 삭제할까요?"):
+        if st.button("정말 삭제할까요?"):
             delete_template(conn, template_id)
+            cached_load_templates.clear()
             st.success("Template deleted.")
             st.rerun()
+            
 
     st.divider()
-
-    # ---- Template items ----
-    st.markdown("### Template components")
-
-    items = load_template_items(conn, template_id)
-
-    if items.empty:
-        st.info("Template에 저장된 component가 없습니다.")
+    st.markdown("### Final volume")
+    if st.session_state["creating_template"]:
+        tmpl_final_volume = st.number_input(
+            "Final volume",
+            min_value=0.0,
+            value=st.session_state.get("tmpl_final_volume", 20.0),
+            step=1.0,
+            key="tmpl_final_volume"
+        )
+        tmpl_final_vol_unit = st.selectbox(
+            "Unit",
+            VOL_UNITS,
+            index=VOL_UNITS.index(
+                st.session_state.get("tmpl_final_vol_unit", "uL")
+            ),
+            key="tmpl_final_vol_unit"
+        )
     else:
-        st.dataframe(
-            items.rename(columns={
-                "stock_id": "Stock ID",
-                "example_target": "Target conc",
-                "example_target_unit": "Target unit",
-                "example_volume": "Volume",
-                "example_volume_unit": "Volume unit",
-                "item_note": "Note"
-            }),
-            use_container_width=True,
-            hide_index=True
+        tmpl_final_volume = st.number_input(
+            "Final volume",
+            min_value=0.0,
+            value=float(row.get("final_volume", 20.0)),
+            step=1.0,
+            key="tmpl_final_volume"
+        )
+        tmpl_final_vol_unit = st.selectbox(
+            "Unit",
+            VOL_UNITS,
+            index=VOL_UNITS.index(
+                row.get("final_volume_unit", "uL")
+            ),
+            key="tmpl_final_vol_unit"
         )
 
+    # ---- Template components ----
+    st.markdown("### Template components")
 
+    if template_id:
+        items = cached_load_template_items(template_id)
+    else:
+        items = pd.DataFrame()
+
+
+    # 편집 모드 상태
+    if "editing_template" not in st.session_state:
+        st.session_state["editing_template"] = False
+
+    if "tmpl_rows" not in st.session_state:
+        st.session_state["tmpl_rows"] = None
+
+
+    
+    # READ-ONLY MODE
+    if not st.session_state["editing_template"]:
+        if items.empty:
+            st.info("Template에 저장된 component가 없습니다.")
+        else:
+            st.dataframe(
+                items.rename(columns={
+                    "stock_id": "Stock ID",
+                    "example_target": "Target conc",
+                    "example_target_unit": "Target unit",
+                    "example_volume": "Volume",
+                    "example_volume_unit": "Volume unit",
+                    "item_note": "Note"
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        if st.button("✏️ Update template"):
+            st.session_state["editing_template"] = True
+            st.session_state["tmpl_rows"] = None
+            st.rerun()
+
+    # EDIT MODE (reaction card
+    else:
+        st.caption(
+            "This editor allows calculation for template validation only. "
+            "Actual experiment records are created in New Reaction."
+        )
+
+        stocks = cached_load_stocks()
+        stock_options = ["(DB 미등록: 임시 시약)"] + stocks["id"].tolist()
+
+        # 최초 진입 시 template_items → rows 변환
+        if st.session_state["tmpl_rows"] is None:
+            rows = []
+            if not items.empty:
+                for _, r in items.iterrows():
+                    rows.append({
+                        "row_id": str(uuid.uuid4()),
+                        "stock_sel": r["stock_id"] or "(DB 미등록: 임시 시약)",
+                        "custom_name": "",
+                        "custom_stock_conc": 0.0,
+                        "custom_stock_unit": "mM",
+                        "target_conc": float(r["example_target"] or 0.0),
+                        "target_unit": r["example_target_unit"] or "mM",
+                        "vol": float(r["example_volume"] or 0.0),
+                        "vol_unit": r["example_volume_unit"] or "uL",
+                        "note": r["item_note"] or "",
+                    })
+            else:
+                rows = [empty_row()]
+
+            st.session_state["tmpl_rows"] = rows
+
+        # ---- Add row ----
+        if st.button("+ Add reagent"):
+            st.session_state["tmpl_rows"].append(empty_row())
+            st.rerun()
+
+        # ---- Render rows (reaction card style) ----
+        for i, row in enumerate(st.session_state["tmpl_rows"]):
+            with st.container(border=True):
+                c1, c2, c3, c4, c5, c6, c7 = st.columns([2.2,1.2,1,1.2,1,2.2,0.6])
+                rid = row["row_id"]
+
+                row["stock_sel"] = c1.selectbox(
+                    "Stock",
+                    stock_options,
+                    index=stock_options.index(row["stock_sel"]) if row["stock_sel"] in stock_options else 0,
+                    key=f"tmpl_stock_{rid}"
+                )
+
+                row["target_conc"] = c2.number_input(
+                    "Target conc",
+                    min_value=0.0,
+                    step=0.0001,
+                    value=row["target_conc"],
+                    key=f"tmpl_tc_{rid}"
+                )
+
+                row["target_unit"] = c3.selectbox(
+                    "Unit",
+                    CONC_UNITS,
+                    index=CONC_UNITS.index(row["target_unit"]),
+                    key=f"tmpl_tu_{rid}"
+                )
+
+                row["vol"] = c4.number_input(
+                    "Volume",
+                    min_value=0.0,
+                    value=row["vol"],
+                    key=f"tmpl_vol_{rid}"
+                )
+
+                row["vol_unit"] = c5.selectbox(
+                    "Vol unit",
+                    VOL_UNITS,
+                    index=VOL_UNITS.index(row["vol_unit"]),
+                    key=f"tmpl_vu_{rid}"
+                )
+
+                row["note"] = c6.text_input(
+                    "Note",
+                    row["note"],
+                    key=f"tmpl_note_{rid}"
+                )
+
+                if c7.button("🗑", key=f"tmpl_del_{rid}"):
+                    st.session_state["tmpl_rows"].pop(i)
+                    st.rerun()
+
+        
+        # Calculation preview
+        
+        st.divider()
+        st.markdown("### Calculation preview")
+
+        tmpl_card = {
+            "name": "Template preview",
+            "final_volume": tmpl_final_volume,
+            "final_vol_unit": tmpl_final_vol_unit,
+            "rows": st.session_state["tmpl_rows"],
+        }
+
+
+        errors, computed, total_uL, final_uL_total = compute_reaction(
+            tmpl_card, stocks, stock_options
+        )
+
+        if errors:
+            st.error("Validation failed:")
+            for e in errors:
+                st.write(f"- {e}")
+        else:
+            if computed:
+                df = pd.DataFrame(computed).sort_values("line_no")
+                st.dataframe(
+                    df[
+                        [
+                            "line_no",
+                            "reagent",
+                            "stock_conc",
+                            "stock_unit",
+                            "target_conc",
+                            "target_unit",
+                            "volume",
+                            "volume_unit",
+                            "amount",
+                            "amount_unit",
+                            "note",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+                fill_uL = final_uL_total - total_uL
+                st.success(f"Fill remaining: {fill_uL:.3f} uL")
+            else:
+                st.info("No computable rows yet.")
+
+        
+        # Save / Cancel
+        c1, c2 = st.columns(2)
+
+        # -----------------------------
+        # CREATE NEW TEMPLATE
+        # -----------------------------
+        if st.session_state["creating_template"]:
+            if c1.button("💾 Create template"):
+                if not new_name.strip():
+                    st.error("Template name is required.")
+                    st.stop()
+
+                # 1️⃣ template 먼저 생성
+                new_template_id = str(uuid.uuid4())
+
+                execute(
+                    """
+                    INSERT INTO templates (
+                        template_id, name, description,
+                        final_volume, final_volume_unit
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        new_template_id,
+                        new_name.strip(),
+                        new_desc.strip() or None,
+                        tmpl_final_volume,
+                        tmpl_final_vol_unit,
+                    )
+                )
+
+                # 2️⃣ template_items 저장
+                for i, r in enumerate(st.session_state["tmpl_rows"], start=1):
+                    execute(
+                        """
+                        INSERT INTO template_items (
+                            template_id, line_no,
+                            stock_id,
+                            example_target, example_target_unit,
+                            example_volume, example_volume_unit,
+                            item_note
+                        )
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        (
+                            new_template_id,
+                            i,
+                            None if r["stock_sel"] == "(DB 미등록: 임시 시약)" else r["stock_sel"],
+                            r["target_conc"] or None,
+                            r["target_unit"],
+                            r["vol"] or None,
+                            r["vol_unit"],
+                            r["note"] or None,
+                        )
+                    )
+
+                cached_load_templates.clear()
+                cached_load_template_items.clear()
+
+                st.session_state["creating_template"] = False
+                st.session_state["editing_template"] = False
+                st.session_state["tmpl_rows"] = None
+
+                st.success("New template created.")
+                st.rerun()
+
+        # -----------------------------
+        # UPDATE EXISTING TEMPLATE
+        # -----------------------------
+        else:
+            if c1.button("💾 Save changes"):
+                execute("DELETE FROM template_items WHERE template_id = %s", (template_id,))
+
+                for i, r in enumerate(st.session_state["tmpl_rows"], start=1):
+                    execute(
+                        """
+                        INSERT INTO template_items (
+                            template_id, line_no,
+                            stock_id,
+                            example_target, example_target_unit,
+                            example_volume, example_volume_unit,
+                            item_note
+                        )
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        (
+                            template_id,
+                            i,
+                            None if r["stock_sel"] == "(DB 미등록: 임시 시약)" else r["stock_sel"],
+                            r["target_conc"] or None,
+                            r["target_unit"],
+                            r["vol"] or None,
+                            r["vol_unit"],
+                            r["note"] or None,
+                        )
+                    )
+
+                # meta update
+                update_template_meta(
+                    conn,
+                    template_id,
+                    new_name.strip(),
+                    new_desc.strip(),
+                    tmpl_final_volume,
+                    tmpl_final_vol_unit,
+                )
+
+                cached_load_template_items.clear()
+                cached_load_templates.clear()
+
+                st.success("Template updated.")
+                st.rerun()
+
+
+    
 # ---------------- reaction card state ----------------
 def empty_row():
     return {
@@ -165,12 +511,13 @@ def new_reaction_card(idx: int):
         "template_name_for_save": "",
         "template_desc_for_save": "",
         "include_in_save_all": True,
+        "fv_key_ver": 0
     }
 
 
 # ---------------- save all cards ----------------
 def save_all_to_db(
-    conn: sqlite3.Connection,
+    conn,
     plan_id: Optional[str],
     plan_title: str,
     plan_notes: str,
@@ -191,54 +538,53 @@ def save_all_to_db(
     if not pid:
         pid = str(uuid.uuid4())
         plan_title_clean = (plan_title or "").strip() or f"{pd.Timestamp.now():%Y%m%d}_{username}"
-        conn.execute(
-            "INSERT INTO plans(plan_id, title, category, created_by, notes) VALUES (?, ?, ?, ?, ?)",
+        execute(
+            "INSERT INTO plans(plan_id, title, category, created_by, notes) VALUES (%s, %s, %s, %s, %s)",
             (pid, plan_title_clean, category, username, plan_notes or None)
         )
 
     # Transaction
     try:
-        with conn:
-            for idx, (card, computed) in enumerate(cards_to_save, start=1):
-                reaction_id = str(uuid.uuid4())
-                rx_name = (card.get("name") or f"Reaction {idx}").strip()
-                rx_title = (title_prefix or "").strip() or ""
-                if rx_title:
-                    full_title = f"{rx_title} :: {rx_name}"
-                else:
-                    full_title = rx_name
+        for idx, (card, computed) in enumerate(cards_to_save, start=1):
+            reaction_id = str(uuid.uuid4())
+            rx_name = (card.get("name") or f"Reaction {idx}").strip()
+            rx_title = (title_prefix or "").strip() or ""
+            if rx_title:
+                full_title = f"{rx_title} :: {rx_name}"
+            else:
+                full_title = rx_name
 
-                final_volume = float(card.get("final_volume") or 0.0)
-                final_vol_unit = str(card.get("final_vol_unit") or "uL")
+            final_volume = float(card.get("final_volume") or 0.0)
+            final_vol_unit = str(card.get("final_vol_unit") or "uL")
 
-                conn.execute(
+            execute(
+                """
+                INSERT INTO reactions(
+                reaction_id, title, category, created_by, final_volume, final_volume_unit, plan_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (reaction_id, full_title, category, username, final_volume, final_vol_unit, pid)
+            )
+
+            for it in computed:
+                execute(
                     """
-                    INSERT INTO reactions(
-                    reaction_id, title, category, created_by, final_volume, final_volume_unit, plan_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO reaction_items(
+                    reaction_id, line_no, stock_id, custom_name, stock_conc, stock_unit,
+                    target_conc, target_conc_unit, volume, volume_unit, amount, amount_unit, note
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (reaction_id, full_title, category, username, final_volume, final_vol_unit, pid)
+                    (
+                        reaction_id, int(it["line_no"]), it.get("stock_id"), it.get("custom_name"),
+                        float(it.get("stock_conc") or 0.0), it.get("stock_unit"),
+                        float(it.get("target_conc") or 0.0), it.get("target_unit"),
+                        float(it.get("volume") or 0.0), it.get("volume_unit"),
+                        float(it.get("amount") or 0.0), it.get("amount_unit") or "nmol",
+                        it.get("note") or None
+                    )
                 )
 
-                for it in computed:
-                    conn.execute(
-                        """
-                        INSERT INTO reaction_items(
-                        reaction_id, line_no, stock_id, custom_name, stock_conc, stock_unit,
-                        target_conc, target_conc_unit, volume, volume_unit, amount, amount_unit, note
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            reaction_id, int(it["line_no"]), it.get("stock_id"), it.get("custom_name"),
-                            float(it.get("stock_conc") or 0.0), it.get("stock_unit"),
-                            float(it.get("target_conc") or 0.0), it.get("target_unit"),
-                            float(it.get("volume") or 0.0), it.get("volume_unit"),
-                            float(it.get("amount") or 0.0), it.get("amount_unit") or "nmol",
-                            it.get("note") or None
-                        )
-                    )
-
-            conn.commit()
+            
         return True, f"Saved {len(cards_to_save)} reaction(s) into plan_id={pid}", pid
     except Exception as e:
         # conn.rollback()
@@ -290,16 +636,10 @@ def export_reactions_to_excel(
 
 # ---------------- main ----------------
 def main():
-    st.set_page_config(page_title="LabCalc (SQLite + Streamlit)", layout="wide")
+    st.set_page_config(page_title="LabCalc", layout="wide")
+    conn = None
     e_page=None
-    if not DB_PATH.exists():
-        st.error(f"DB not found at {DB_PATH}. 먼저 `python db_init.py` 실행하세요.")
-        st.stop()
 
-    conn = get_conn(DB_PATH)
-    ensure_plans_table(conn)
-    ensure_epsilon_table(conn)
-    ensure_labeling_records_table(conn)
 
     st.title("LabCalc")
 
@@ -325,15 +665,13 @@ def main():
 
 
             st.divider()
-    
-    
 
 
     # ---------------- Stock DB ----------------
     if page == "Stock DB":
         st.subheader("Stock DB (등록/수정/삭제)")
 
-        stocks = load_stocks(conn)
+        stocks = cached_load_stocks()
         st.dataframe(stocks, use_container_width=True, hide_index=True)
 
         st.divider()
@@ -386,13 +724,15 @@ def main():
                     try:
                         insert_stock(conn, stock_id, name.strip(), stock_conc, stock_unit, notes.strip())
                         st.success(f"Saved: {stock_id}")
-                        st.rerun()
-                    except sqlite3.IntegrityError as e:
+                        cached_load_stocks.clear()
+                        
+                    except psycopg2.IntegrityError as e:
                         st.error("중복이거나(id 또는 name+conc+unit), 제약조건 위반입니다.")
+                        cached_load_stocks.clear()
                         st.caption(str(e))
 
         elif mode == "Update":
-            stocks = load_stocks(conn)
+            stocks = cached_load_stocks()
             if stocks.empty:
                 st.info("수정할 stock이 없습니다.")
             else:
@@ -408,14 +748,15 @@ def main():
                     if submitted:
                         try:
                             update_stock(conn, sel, name.strip(), stock_conc, stock_unit, notes.strip())
+                            cached_load_stocks.clear()
                             st.success("Updated.")
                             st.rerun()
-                        except sqlite3.IntegrityError as e:
+                        except psycopg2.IntegrityError as e:
                             st.error("업데이트 결과가 (name, conc, unit) 중복을 만들었습니다.")
                             st.caption(str(e))
 
         else:  # Delete
-            stocks = load_stocks(conn)
+            stocks = cached_load_stocks()
             if stocks.empty:
                 st.info("삭제할 stock이 없습니다.")
             else:
@@ -425,8 +766,9 @@ def main():
                     try:
                         delete_stock(conn, sel)
                         st.success("Deleted.")
+                        cached_load_stocks.clear()
                         st.rerun()
-                    except sqlite3.IntegrityError as e:
+                    except psycopg2.IntegrityError as e:
                         st.error("다른 데이터에서 참조 중이라 삭제가 제한될 수 있습니다.")
                         st.caption(str(e))
 
@@ -441,22 +783,12 @@ def main():
 
         # ---- Plan UI ----
         st.markdown("### Plan")
-        plans_df = load_plans(conn)
-        plan_titles = ["(New plan)"] + (plans_df["title"].tolist() if not plans_df.empty else [])
-        plan_choice = st.selectbox("Select plan", plan_titles, index=0, key="plan_choice")
-
         plan_title_in = st.text_input("Plan title", value="", key="plan_title_in")
         plan_notes_in = st.text_input("Plan notes (optional)", value="", key="plan_notes_in")
 
         if "current_plan_id" not in st.session_state:
             st.session_state["current_plan_id"] = None
 
-        if plan_choice != "(New plan)":
-            st.session_state["current_plan_id"] = plans_df.loc[plans_df["title"] == plan_choice, "plan_id"].iloc[0]
-            st.caption(f"Using existing plan_id: {st.session_state['current_plan_id']}")
-        else:
-            st.session_state["current_plan_id"] = None
-            st.caption("New plan will be created when you save.")
 
         # ---- Common meta (applied to all reactions when saving) ----
         st.markdown("### Plan meta")
@@ -467,7 +799,7 @@ def main():
             title_prefix = st.text_input("Title prefix (optional)", value="", key="title_prefix")
 
         # ---- Load stocks once ----
-        stocks = load_stocks(conn)
+        stocks = cached_load_stocks()
         stock_options = ["(DB 미등록: 임시 시약)"] + (stocks["id"].tolist() if not stocks.empty else [])
 
         # ---- Reaction cards state ----
@@ -485,9 +817,9 @@ def main():
         st.divider()
 
         # ---- Templates list (shared list, but load applies per-card) ----
-        tmpl_df = load_templates(conn)
+        tmpl_df = cached_load_templates()
         tmpl_names = ["(None)"] + (tmpl_df["name"].tolist() if not tmpl_df.empty else [])
-
+        
         # ---- Render each reaction card ----
         all_card_results: List[Tuple[int, List[str], List[Dict[str, Any]], float, float]] = []  # (idx, errors, computed, total_uL, final_uL_total)
 
@@ -521,27 +853,53 @@ def main():
 
                 tA, tB, tC, tD = st.columns([1, 1.2, 1.8, 3])
                 load_btn = tA.button("Load", key=f"{rx_key}_tmpl_load")
-                save_btn = tB.button("Save tmpl", key=f"{rx_key}_tmpl_save")
+                
                 card["template_name_for_save"] = tC.text_input("Template name", value=card.get("template_name_for_save", ""), key=f"{rx_key}_tmpl_name")
                 card["template_desc_for_save"] = tD.text_input("Template desc", value=card.get("template_desc_for_save", ""), key=f"{rx_key}_tmpl_desc")
 
                 if load_btn and card["template_select"] != "(None)":
-                    template_id = tmpl_df.loc[tmpl_df["name"] == card["template_select"], "template_id"].iloc[0]
-                    items = load_template_items(conn, template_id)
-                    # fill rows from template
+                    tmpl_row = tmpl_df.loc[
+                    tmpl_df["name"] == card["template_select"]
+                    ].iloc[0]
+
+                    fv_key = f"{rx_key}_fv"
+                    fvu_key = f"{rx_key}_fvu"
+
+                    # 🔑 핵심: 기존 위젯 state 제거
+                    if fv_key in st.session_state:
+                        del st.session_state[fv_key]
+                    if fvu_key in st.session_state:
+                        del st.session_state[fvu_key]
+
+                    # card에 template 값 세팅
+                    card["final_volume"] = float(
+                        tmpl_row["final_volume"]
+                        if tmpl_row["final_volume"] is not None
+                        else 20.0
+                    )
+                    card["final_vol_unit"] = str(
+                        tmpl_row["final_volume_unit"]
+                        if tmpl_row["final_volume_unit"] is not None
+                        else "uL"
+                    )
+
+                    template_id = tmpl_row["template_id"]
+                    items = load_template_items(None, template_id)
+
                     card["rows"] = [empty_row() for _ in range(len(items) if len(items) > 0 else 1)]
 
                     for i, row in items.reset_index(drop=True).iterrows():
                         r = card["rows"][i]
                         r["stock_sel"] = str(row["stock_id"])
-                        # use example_target or example_volume
                         r["target_conc"] = float(row["example_target"]) if row["example_target"] is not None else 0.0
                         r["target_unit"] = str(row["example_target_unit"] or "mM")
                         r["vol"] = float(row["example_volume"]) if row["example_volume"] is not None else 0.0
                         r["vol_unit"] = str(row["example_volume_unit"] or "uL")
                         r["note"] = str(row["item_note"] or "")
-                    st.success(f"Loaded template into {card['name']}")
+
+                    st.success(f"Template '{card['template_select']}' loaded")
                     st.rerun()
+
 
                 # components count
 
@@ -636,20 +994,6 @@ def main():
                         )
                         fill_uL = final_uL_total - total_uL
                         st.success(f"Fill remaining: {fill_uL:.3f} uL")
-
-                        # save template from THIS card (needs computed)
-                        if save_btn:
-                            ok, msg = save_template_from_computed(
-                                conn,
-                                card.get("template_name_for_save", ""),
-                                card.get("template_desc_for_save", ""),
-                                computed
-                            )
-                            if ok:
-                                st.success(msg)
-                                st.rerun()
-                            else:
-                                st.error(msg)
 
         st.divider()
 
@@ -784,34 +1128,15 @@ def main():
         if show_saved and st.session_state.get("current_plan_id"):
             st.markdown("### Saved reactions in this plan")
             pid = st.session_state["current_plan_id"]
-            saved = pd.read_sql_query(
-                """
-                SELECT reaction_id, title, created_at, final_volume, final_volume_unit
-                FROM reactions
-                WHERE plan_id = ?
-                ORDER BY created_at DESC
-                """,
-                conn, params=(pid,)
-            )
+            saved = cached_reactions_in_plan(pid)
+
             st.dataframe(saved, use_container_width=True, hide_index=True)
     if page == "Plans":
         st.subheader("Reaction Plans Records")
 
         # ---- Load plans ----
-        plans_df = pd.read_sql_query(
-            """
-            SELECT
-                plan_id,
-                title,
-                category,
-                created_by,
-                created_at,
-                notes
-            FROM plans
-            ORDER BY created_at DESC
-            """,
-            conn
-        )
+        plans_df = cached_load_plans()
+
 
         if plans_df.empty:
             st.info("저장된 plan이 없습니다.")
@@ -870,7 +1195,7 @@ def main():
         st.divider()
 
         # ---- Load reactions in plan ----
-        reactions_df = pd.read_sql_query(
+        rows = fetchall(
             """
             SELECT
                 reaction_id,
@@ -879,11 +1204,21 @@ def main():
                 final_volume_unit,
                 created_at
             FROM reactions
-            WHERE plan_id = ?
+            WHERE plan_id = %s
             ORDER BY created_at
             """,
-            conn,
-            params=(plan_id,)
+            (plan_id,),
+        )
+
+        reactions_df = pd.DataFrame(
+            rows,
+            columns=[
+                "reaction_id",
+                "title",
+                "final_volume",
+                "final_volume_unit",
+                "created_at",
+            ],
         )
 
         st.markdown("### Reactions in this plan")
@@ -920,7 +1255,8 @@ def main():
         st.divider()
 
         # ---- Load reaction composition ----
-        items_df = pd.read_sql_query(
+
+        rows = fetchall(
             """
             SELECT
                 ri.line_no,
@@ -936,11 +1272,27 @@ def main():
                 ri.note
             FROM reaction_items ri
             LEFT JOIN stocks s ON ri.stock_id = s.id
-            WHERE ri.reaction_id = ?
+            WHERE ri.reaction_id = %s
             ORDER BY ri.line_no
             """,
-            conn,
-            params=(reaction_id,)
+            (reaction_id,),
+        )
+
+        items_df = pd.DataFrame(
+            rows,
+            columns=[
+                "line_no",
+                "reagent",
+                "stock_conc",
+                "stock_unit",
+                "target_conc",
+                "target_conc_unit",
+                "volume",
+                "volume_unit",
+                "amount",
+                "amount_unit",
+                "note",
+            ],
         )
 
         st.markdown("### Reaction composition")
@@ -954,12 +1306,9 @@ def main():
 
 
     if e_page == "Labeling Efficiency":
-        eps_df = get_eps_db(conn)
+        eps_df = cached_eps_db()
         eps_names = (
-            get_eps_db(conn)["name"]
-            .dropna()
-            .unique()
-            .tolist()
+            eps_df["name"].dropna().unique().tolist()
         )
 
 
@@ -1009,21 +1358,23 @@ def main():
             )
 
 
-            eps_target_data = get_epsilon_value(
-                conn,
-                target_name,
-                target_wavelength
-            )
+            hit = eps_df[
+                (eps_df["name"] == target_name)
+                & (eps_df["wavelength"] == target_wavelength)
+            ]
 
-            if eps_target_data:
-                eps_target_default = eps_target_data["epsilon"]
+            if not hit.empty:
+                eps_target_default = float(hit.iloc[0]["epsilon"])
+            else:
+                eps_target_default = 0.0
+
+
+            if not hit.empty:
+                eps_target_default = float(hit.iloc[0]["epsilon"])
                 st.caption("ε loaded from DB")
             else:
                 eps_target_default = 0.0
                 st.caption("ε not found → manual input")
-
-
-                st.caption("ε loaded from DB (editable)")
 
 
             eps_target = st.number_input(
@@ -1040,6 +1391,7 @@ def main():
                         wavelength=target_wavelength,
                         epsilon=float(eps_target),
                     )
+                    cached_eps_db.clear()
                     st.success(f"ε saved for {target_name}")
                 else:
                     st.error("Target name과 ε 값이 필요합니다.")
@@ -1137,6 +1489,7 @@ def main():
                         wavelength=dye_wavelength,
                         epsilon=float(eps_dye),
                     )
+                    cached_eps_db.clear()
                     st.success(f"ε saved for {dye_name}")
                 else:
                     st.error("Dye name과 ε 값이 필요합니다.")
@@ -1145,7 +1498,7 @@ def main():
 
         st.divider()
 
-        # ----------------------------
+        
         # 계산 (Beer–Lambert)
         # ---- correction factor 먼저 ----
         # ---- 초기값 선언 (UI/저장용) ----
@@ -1161,8 +1514,8 @@ def main():
         can_calc = False
 
         # correction factor (dye → target 파장)
-        cf = get_cf(conn, dye_name, target_wavelength)
-        cf = cf if cf is not None else 0.0  # CF 없으면 보정 안 함
+        cf_df = cached_cf_db()
+        cf = lookup_cf(cf_df, dye_name, target_wavelength)
         cf_used = cf if cf > 0 else None
 
         # Target concentration
@@ -1174,6 +1527,9 @@ def main():
             st.caption(
                 f"CF applied: A_target_corr = A_target − ({cf} × A_dye)"
             )
+        else:
+            st.caption("CF not applied (no correction factor found)")
+
 
         # Dye concentration
         if A_dye > 0 and eps_dye > 0:
@@ -1316,7 +1672,7 @@ def main():
                 st.error("계산값이 없습니다. A, ε 값을 먼저 입력하세요.")
             else:
                 record_id = str(uuid.uuid4())
-                conn.execute(
+                execute(
                     """
                     INSERT INTO labeling_records (
                         record_id, created_by,
@@ -1334,12 +1690,12 @@ def main():
                         note
                     )
                     VALUES (
-                        ?, ?, ?, ?, ?,?,
-                        ?, ?, ?, ?,
-                        ?, ?, ?,
-                        ?, ?, ?,
-                        ?, ?, ?, ?,
-                        ?
+                        %s, %s, %s, %s, %s,%s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s
                     )
                     """,
                     (
@@ -1358,9 +1714,9 @@ def main():
                     )
                 )
 
-                conn.commit()
+                cached_labeling_records.clear()
                 st.success("✅ Labeling record saved.")
-
+                
 
             # 저장
             st.divider()
@@ -1373,23 +1729,8 @@ def main():
     if e_page == "Labeling Records":
         st.subheader("Labeling Efficiency Records")
 
-        df = pd.read_sql_query(
-            """
-            SELECT
-                title,
-                created_at,
-                created_by,
-                target_name,
-                dye_name,
-                labeling_ratio,
-                etoh_efficiency,
-                uv_purity,
-                note
-            FROM labeling_records
-            ORDER BY created_at DESC
-            """,
-            conn
-        )
+        df = cached_labeling_records()
+
         df["created_at"] = (
             pd.to_datetime(df["created_at"]) + timedelta(hours=9)
         )
@@ -1421,7 +1762,7 @@ def main():
             "Values are reused across experiments."
         )
         # ---- CF table ----
-        cf_df = get_cf_db(conn)
+        cf_df = cached_cf_db()
 
         if not cf_df.empty:
             st.markdown("### Correction Factors (CF)")
@@ -1435,7 +1776,7 @@ def main():
 
 
         # ---- Load epsilon DB ----
-        eps_df = get_eps_db(conn)
+        eps_df = cached_eps_db()
         
         dye_wavelength_options = (
             eps_df["wavelength"]
@@ -1540,33 +1881,43 @@ def main():
                 placeholder="literature / supplier / estimate"
             )
         # --- CF 관리 전용 입력 ---
+       
+        # app.py (Epsilon DB 섹션의 "Spectral correction factor (CF)" 부분)
+
         st.markdown("### Spectral correction factor (CF)")
 
-        cf_dye_name = st.text_input(
+        # eps DB의 name 목록을 토글(셀렉트)로
+        cf_dye_name = st.selectbox(
             "Dye name for CF",
-            placeholder="Cy3 / Cy5 / Alexa"
+            options=eps_name_options,
+            index=None,
+            placeholder="Select dye (or type new)",
+            accept_new_options=True,
+            key="cf_dye_name",
         )
 
         cf_target_wavelength = st.selectbox(
             "Target wavelength for CF (nm)",
             [260, 280],
-            index=0
+            index=0,
+            key="cf_target_wavelength",
         )
 
+        # 초기값 반드시 선언 (안 그러면 cf_val referenced before assignment 터짐)
         cf_val = None
-        if cf_dye_name.strip():
-            cf_val = get_cf(conn, cf_dye_name.strip(), cf_target_wavelength)
+        if cf_dye_name:
+            cf_val = lookup_cf(cf_df, cf_dye_name.strip(), cf_target_wavelength)
 
         cf_input = st.number_input(
             f"CF: {cf_dye_name or 'dye'} → {cf_target_wavelength} nm",
             min_value=0.0,
             step=0.001,
-            value=cf_val if cf_val is not None else 0.0,
+            value=float(cf_val) if cf_val is not None else 0.0,
             help="A_target_corr = A_target - CF × A_dye"
         )
 
         if st.button("Save CF"):
-            if not cf_dye_name.strip():
+            if not cf_dye_name or not cf_dye_name.strip():
                 st.error("Dye name is required for CF.")
             else:
                 upsert_cf(
@@ -1577,9 +1928,11 @@ def main():
                     note="UV cross-absorbance correction"
                 )
                 st.success("CF saved.")
+                cached_cf_db.clear()
+                cached_eps_db.clear()
 
         # ---- Save button ----
-        if st.button("💾 Save ε", use_container_width=True):
+        if st.button("💾 Save ε/CF values", use_container_width=True):
             if not eps_name.strip():
                 st.error("Name is required.")
             elif eps_value <= 0:
@@ -1592,11 +1945,10 @@ def main():
                     epsilon=float(eps_value),
                     note=eps_note.strip() or None,
                 )
-
+                cached_eps_db.clear()
                 st.success(
                     f"ε saved: {eps_name.strip()} @ {int(eps_wavelength)} nm"
                 )
-                st.rerun()
 
 if __name__ == "__main__":
     main()
