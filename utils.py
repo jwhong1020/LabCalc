@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 from typing import Tuple, Dict, Any, List
 
-
+import pandas as pd
 # ---------------- string / id utils ----------------
 def slugify(s: str) -> str:
     s = str(s).strip()
@@ -231,3 +231,18 @@ def compute_reaction(
         errors.append("총 volume이 final volume 초과")
 
     return errors, computed, total_uL, final_uL
+
+# utils.py - lookup_cf()를 아래처럼 교체 (None/empty 방어 포함)
+def lookup_cf(cf_df, dye_name, target_wavelength) -> float:
+    if not dye_name or cf_df is None or cf_df.empty:
+        return 0.0
+
+    hit = cf_df[
+        (cf_df["dye_name"] == dye_name)
+        & (cf_df["target_wavelength"] == target_wavelength)
+    ]
+    if hit.empty:
+        return 0.0
+
+    val = hit.iloc[0]["factor"]
+    return float(val) if pd.notna(val) else 0.0
