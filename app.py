@@ -674,7 +674,12 @@ def main():
         st.subheader("Stock DB (등록/수정/삭제)")
 
         stocks = cached_load_stocks()
-        st.dataframe(stocks, use_container_width=True, hide_index=True)
+        st.dataframe(stocks, use_container_width=True, hide_index=True,
+                     column_config={
+                    "notes": st.column_config.TextColumn(
+                        "notes", width="large"
+                    )}
+                    )
 
         st.divider()
         st.markdown("### Add / Update Stock")
@@ -1049,6 +1054,8 @@ def main():
                 )
                 if ok:
                     st.session_state["current_plan_id"] = pid
+                    
+                    cached_load_plans.clear()
                     st.success(msg)
                     st.rerun()
                 else:
