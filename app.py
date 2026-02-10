@@ -598,6 +598,15 @@ def export_reactions_to_excel(
 ) -> BytesIO:
     """
     reactions: [(reaction_name, result_df), ...]
+    result_df columns expected:
+    [
+        line_no, reagent,
+        stock_conc, stock_unit,
+        target_conc, target_unit,
+        volume, volume_unit,
+        amount, amount_unit,
+        note
+    ]
     """
     wb = Workbook()
     ws = wb.active
@@ -607,34 +616,86 @@ def export_reactions_to_excel(
     header_font = Font(bold=True)
 
     for rx_name, df in reactions:
+        # -----------------------------
         # Reaction title
+        # -----------------------------
         ws.cell(row=row_cursor, column=1, value=f"Reaction: {rx_name}")
         ws.cell(row=row_cursor, column=1).font = Font(bold=True)
         row_cursor += 2
 
-        # Table header
-        for col_idx, col in enumerate(df.columns, start=1):
+        # -----------------------------
+        # 🔑 Export 전용 DF 가공
+        # -----------------------------
+        df_export = df.copy()
+
+        # 값 + unit 합치기
+        df_export["Stock conc"] = (
+            df_export["stock_conc"].astype(str)
+            + " "
+            + df_export["stock_unit"]
+        )
+
+        df_export["Target conc"] = (
+            df_export["target_conc"].astype(str)
+            + " "
+            + df_export["target_unit"]
+        )
+
+        df_export["Volume"] = (
+            df_export["volume"].astype(str)
+            + " "
+            + df_export["volume_unit"]
+        )
+
+        df_export["Amount"] = (
+            df_export["amount"].astype(str)
+            + " "
+            + df_export["amount_unit"]
+        )
+
+        # 엑셀에 쓸 컬럼만 선택 (사람 기준)
+        df_export = df_export[
+            [
+                "line_no",
+                "reagent",
+                "Stock conc",
+                "Target conc",
+                "Volume",
+                "Amount",
+                "note",
+            ]
+        ]
+
+        # -----------------------------
+        # Header
+        # -----------------------------
+        for col_idx, col in enumerate(df_export.columns, start=1):
             cell = ws.cell(row=row_cursor, column=col_idx, value=col)
             cell.font = header_font
 
         row_cursor += 1
 
+        # -----------------------------
         # Table body
-        for _, r in df.iterrows():
-            for col_idx, col in enumerate(df.columns, start=1):
+        # -----------------------------
+        for _, r in df_export.iterrows():
+            for col_idx, col in enumerate(df_export.columns, start=1):
                 ws.cell(row=row_cursor, column=col_idx, value=r[col])
             row_cursor += 1
 
         row_cursor += 2  # blank lines between reactions
 
+    # -----------------------------
     # Auto column width
+    # -----------------------------
     for col_idx in range(1, ws.max_column + 1):
-        ws.column_dimensions[get_column_letter(col_idx)].width = 14
+        ws.column_dimensions[get_column_letter(col_idx)].width = 16
 
     bio = BytesIO()
     wb.save(bio)
     bio.seek(0)
     return bio
+
 
 # ---------------- main ----------------
 def main():
