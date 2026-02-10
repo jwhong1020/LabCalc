@@ -431,7 +431,9 @@ def render_template_manager(conn):
                 st.session_state["creating_template"] = False
                 st.session_state["editing_template"] = False
                 st.session_state["tmpl_rows"] = None
-
+                
+                if "template_select_box" in st.session_state:
+                    del st.session_state["template_select_box"]
                 st.success("New template created.")
                 st.rerun()
 
