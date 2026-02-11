@@ -1209,7 +1209,7 @@ def main():
 
 
         if plans_df.empty:
-            st.info("저장된 plan이 없습니다.")
+            st.info("No saved plans found")
             return
 
         st.markdown("### Plans")
@@ -1294,7 +1294,7 @@ def main():
         st.markdown("### Reactions in this plan")
 
         if reactions_df.empty:
-            st.info("이 plan에는 reaction이 없습니다.")
+            st.info("No reactions in this plan")
             return
         reactions_df["created_at"] = (
             pd.to_datetime(reactions_df["created_at"]) + timedelta(hours=9)
@@ -1372,8 +1372,66 @@ def main():
             hide_index=True
         )
 
-        return
+        st.markdown("### Export this plan")
 
+        export_data = []
+
+        for _, rx in reactions_df.iterrows():
+            rx_id = rx["reaction_id"]
+
+            rows = fetchall(
+                """
+                SELECT
+                    ri.line_no,
+                    COALESCE(s.name, ri.custom_name) AS reagent,
+                    ri.stock_conc,
+                    ri.stock_unit,
+                    ri.target_conc,
+                    ri.target_conc_unit,
+                    ri.volume,
+                    ri.volume_unit,
+                    ri.amount,
+                    ri.amount_unit,
+                    ri.note
+                FROM reaction_items ri
+                LEFT JOIN stocks s ON ri.stock_id = s.id
+                WHERE ri.reaction_id = %s
+                ORDER BY ri.line_no
+                """,
+                (rx_id,),
+            )
+
+            df = pd.DataFrame(
+                rows,
+                columns=[
+                    "line_no",
+                    "reagent",
+                    "stock_conc",
+                    "stock_unit",
+                    "target_conc",
+                    "target_unit",
+                    "volume",
+                    "volume_unit",
+                    "amount",
+                    "amount_unit",
+                    "note",
+                ],
+            )
+
+            export_data.append((rx["title"], df))
+
+        if export_data:
+            excel_file = export_reactions_to_excel(export_data)
+
+            st.download_button(
+                label="📥 Export this plan (Excel)",
+                data=excel_file,
+                file_name=f"{plan_row['title']}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        else:
+            st.warning("No reactions available for export.")
 
     if e_page == "Labeling Efficiency":
         eps_df = cached_eps_db()
