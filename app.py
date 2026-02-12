@@ -1950,8 +1950,8 @@ def main():
                         epsilon=float(eps_value),
                     )
                     cached_eps_db.clear()
-                    st.success("ε added.")
                     st.rerun()
+                    st.success("ε added.")            
 
         # ---------------- UPDATE ----------------
         elif eps_mode == "Update":
@@ -2033,6 +2033,24 @@ def main():
         # CF MODE
         # ======================================================
         st.markdown("## Correction Factor (CF) Management")
+        st.divider()
+        st.markdown("### Current CF values")
+
+        if cf_df.empty:
+            st.info("CF database is empty.")
+        else:
+            st.dataframe(
+                cf_df.sort_values(["dye_name", "target_wavelength"]),
+                width="stretch",
+                hide_index=True
+            )
+            cf_df_display = cf_df.rename(columns={
+                "dye_name": "Dye",
+                "target_wavelength": "Target λ (nm)",
+                "factor": "CF",
+                "note": "Note"
+            })
+
 
         cf_mode = st.radio(
             "CF Mode",
