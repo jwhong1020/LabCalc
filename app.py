@@ -1511,6 +1511,7 @@ def main():
                         epsilon=float(eps_target),
                     )
                     cached_eps_db.clear()
+                    st.rerun()
                     st.success(f"ε saved for {target_name}")
                 else:
                     st.error("Target name과 ε 값이 필요합니다.")
@@ -1609,6 +1610,7 @@ def main():
                         epsilon=float(eps_dye),
                     )
                     cached_eps_db.clear()
+                    st.rerun()
                     st.success(f"ε saved for {dye_name}")
                 else:
                     st.error("Dye name과 ε 값이 필요합니다.")
