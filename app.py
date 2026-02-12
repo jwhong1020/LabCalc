@@ -50,10 +50,10 @@ from db_utils_pg import (
     load_templates, load_template_items, delete_template, update_template_meta,
     save_template_from_computed,
 
-    upsert_epsilon, 
+    upsert_epsilon, delete_epsilon,
     get_epsilon_value,
     
-    get_cf, upsert_cf, get_cf_db,
+    get_cf, upsert_cf, get_cf_db,delete_cf,
     fetchall
 )
 
@@ -219,7 +219,7 @@ def render_template_manager(conn):
                     "example_volume_unit": "Volume unit",
                     "item_note": "Note"
                 }),
-                use_container_width=True,
+                width='stretch',
                 hide_index=True
             )
 
@@ -358,7 +358,7 @@ def render_template_manager(conn):
                             "note",
                         ]
                     ],
-                    use_container_width=True,
+                    width='stretch',
                     hide_index=True
                 )
 
@@ -735,7 +735,7 @@ def main():
         st.subheader("Stock DB (등록/수정/삭제)")
 
         stocks = cached_load_stocks()
-        st.dataframe(stocks, use_container_width=True, hide_index=True,
+        st.dataframe(stocks, width='stretch', hide_index=True,
                      column_config={
                     "notes": st.column_config.TextColumn(
                         "notes", width="large"
@@ -1058,14 +1058,14 @@ def main():
                         st.dataframe(
                             df[["line_no", "reagent", "stock_conc", "stock_unit", "target_conc", "target_unit",
                                 "volume", "volume_unit", "amount", "amount_unit", "note"]],
-                            use_container_width=True, hide_index=True
+                            width='stretch', hide_index=True
                         )
                         fill_uL = final_uL_total - total_uL
                         st.success(f"Fill remaining: {fill_uL:.3f} uL")
 
         st.divider()
 
-        if st.button("➕ Add Reaction", use_container_width=True):
+        if st.button("➕ Add Reaction", width='stretch'):
             st.session_state["rx_cards"].append(
                 new_reaction_card(len(st.session_state["rx_cards"]))
             )
@@ -1200,7 +1200,7 @@ def main():
             pid = st.session_state["current_plan_id"]
             saved = cached_reactions_in_plan(pid)
 
-            st.dataframe(saved, use_container_width=True, hide_index=True)
+            st.dataframe(saved, width='stretch', hide_index=True)
     if page == "Plans":
         st.subheader("Reaction Plans Records")
 
@@ -1223,7 +1223,7 @@ def main():
 
         st.dataframe(
             plans_df.drop(columns=["plan_id"]),
-            use_container_width=True,
+            width='stretch',
             hide_index=True,
             height = 300
         )
@@ -1306,7 +1306,7 @@ def main():
 
         st.dataframe(
             reactions_df.drop(columns=["reaction_id"]),
-            use_container_width=True,
+            width='stretch',
             hide_index=True
         )
 
@@ -1368,7 +1368,7 @@ def main():
         st.markdown("### Reaction composition")
         st.dataframe(
             items_df,
-            use_container_width=True,
+            width='stretch',
             hide_index=True
         )
 
@@ -1428,7 +1428,7 @@ def main():
                 data=excel_file,
                 file_name=f"{plan_row['title']}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True
+                width='stretch'
             )
         else:
             st.warning("No reactions available for export.")
@@ -1621,8 +1621,6 @@ def main():
                     st.success(f"ε saved for {dye_name}")
                 else:
                     st.error("Dye name과 ε 값이 필요합니다.")
-
-
 
         st.divider()
 
@@ -1873,7 +1871,7 @@ def main():
         if df.empty:
             st.info("저장된 labeling record가 없습니다.")
         else:
-            st.dataframe(df,use_container_width=True,hide_index=True,
+            st.dataframe(df,width='stretch',hide_index=True,
                 column_config={
                     "Title": st.column_config.TextColumn(
                         "Title", width="large"
@@ -1896,7 +1894,7 @@ def main():
             st.markdown("### Correction Factors (CF)")
             st.dataframe(
                 cf_df,
-                use_container_width=True,
+                width='stretch',
                 hide_index=True
             )
         else:
@@ -1924,7 +1922,7 @@ def main():
             st.markdown("### Current ε values")
             st.dataframe(
                 eps_df.sort_values(["name", "wavelength"]),
-                use_container_width=True,
+                width='stretch',
                 hide_index=True
             )
 
@@ -1936,78 +1934,117 @@ def main():
             "Same (name, wavelength) will be overwritten. "
             "Deletion is intentionally disabled to prevent accidents."
         )
-
-        c1, c2, c3, c4, c5 = st.columns([2, 1, 2, 2, 3])
-
-        # ε DB에서 name 목록
-        eps_name_options = (
-            eps_df["name"]
-            .dropna()
-            .unique()
-            .tolist()
+        mode = st.radio(
+            "Mode",
+            ["Add / Update", "Delete"],
+            horizontal=True,
+            key="eps_mode"
         )
+        if mode == "Delete":
 
-        with c1:
-            eps_name = st.selectbox(
-                "Name *",
-                options=eps_name_options,
-                index=None,
-                placeholder="Select existing or type new",
-                accept_new_options=True,
-                key="eps_name"
-            )
-            
-        if eps_name:
-            eps_wavelength_options = (
-                eps_df.loc[eps_df["name"] == eps_name, "wavelength"]
+            if eps_df.empty:
+                st.info("No ε values to delete.")
+            else:
+                eps_df_display = eps_df.copy()
+                eps_df_display["label"] = (
+                    eps_df_display["name"]
+                    + " @ "
+                    + eps_df_display["wavelength"].astype(str)
+                    + " nm"
+                )
+
+                selected = st.selectbox(
+                    "Select ε entry to delete",
+                    eps_df_display["label"].tolist()
+                )
+
+                row = eps_df_display[
+                    eps_df_display["label"] == selected
+                ].iloc[0]
+
+                st.warning("This action cannot be undone.")
+
+                if st.button("Delete ε value"):
+                    delete_epsilon(
+                        row["name"],
+                        int(row["wavelength"])
+                    )
+                    cached_eps_db.clear()
+                    st.success("ε value deleted.")
+                    st.rerun()
+        if mode == "Add / Update":
+
+            c1, c2, c3, c4, c5 = st.columns([2, 1, 2, 2, 3])
+
+            # ε DB에서 name 목록
+            eps_name_options = (
+                eps_df["name"]
                 .dropna()
-                .astype(int)
                 .unique()
                 .tolist()
             )
-        else:
-            eps_wavelength_options = []
 
-        with c2:
-            if eps_wavelength_options:
-                eps_wavelength = st.selectbox(
-                    "Wavelength (nm) *",
-                    options=eps_wavelength_options,
-                    index=0,
-                    help="Loaded from ε DB"
+            with c1:
+                eps_name = st.selectbox(
+                    "Name *",
+                    options=eps_name_options,
+                    index=None,
+                    placeholder="Select existing or type new",
+                    accept_new_options=True,
+                    key="eps_name"
+                )
+                
+            if eps_name:
+                eps_wavelength_options = (
+                    eps_df.loc[eps_df["name"] == eps_name, "wavelength"]
+                    .dropna()
+                    .astype(int)
+                    .unique()
+                    .tolist()
                 )
             else:
-                eps_wavelength = st.number_input(
-                    "Wavelength (nm) *",
-                    min_value=200,
-                    max_value=800,
-                    step=1,
-                    value=650
+                eps_wavelength_options = []
+
+            with c2:
+                if eps_wavelength_options:
+                    eps_wavelength = st.selectbox(
+                        "Wavelength (nm) *",
+                        options=eps_wavelength_options,
+                        index=0,
+                        help="Loaded from ε DB"
+                    )
+                else:
+                    eps_wavelength = st.number_input(
+                        "Wavelength (nm) *",
+                        min_value=200,
+                        max_value=800,
+                        step=1,
+                        value=650
+                    )
+
+
+            eps_existing = None
+            if eps_name and eps_wavelength:
+                eps_existing = get_epsilon_value(
+                    conn,
+                    eps_name,
+                    int(eps_wavelength)
                 )
 
+            with c3:
+                eps_value = st.number_input(
+                    "ε (M⁻¹·cm⁻¹) *",
+                    min_value=0.0,
+                    step=1000.0,
+                    format="%.0f",
+                    value=float(eps_existing["epsilon"]) if eps_existing else 0.0
+                )
 
-        eps_existing = None
-        if eps_name and eps_wavelength:
-            eps_existing = get_epsilon_value(
-                conn,
-                eps_name,
-                int(eps_wavelength)
-            )
-
-        with c3:
-            eps_value = st.number_input(
-                "ε (M⁻¹·cm⁻¹) *",
-                min_value=0.0,
-                step=1000.0,
-                format="%.0f",
-                value=float(eps_existing["epsilon"]) if eps_existing else 0.0
-            )
-
-        with c5:
-            eps_note = st.text_input(
-                "Note (optional)",
-                placeholder="literature / supplier / estimate"
-            )
+            with c5:
+                eps_note = st.text_input(
+                    "Note (optional)",
+                    placeholder="literature / supplier / estimate"
+                )
         # --- CF 관리 전용 입력 ---
        
         # app.py (Epsilon DB 섹션의 "Spectral correction factor (CF)" 부분)
@@ -2060,7 +2097,7 @@ def main():
                 cached_eps_db.clear()
 
         # ---- Save button ----
-        if st.button("💾 Save ε/CF values", use_container_width=True):
+        if st.button("💾 Save ε/CF values", width='stretch'):
             if not eps_name.strip():
                 st.error("Name is required.")
             elif eps_value <= 0:

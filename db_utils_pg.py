@@ -100,6 +100,14 @@ def upsert_epsilon(
         (name, wavelength, epsilon, note),
     )
 
+def delete_epsilon(name: str, wavelength: int) -> None:
+    execute(
+        """
+        DELETE FROM epsilon_db
+        WHERE name = %s AND wavelength = %s
+        """,
+        (name, wavelength),
+    )
 
 def get_epsilon_value(
     conn,
@@ -169,6 +177,14 @@ def upsert_cf(
          dye_name, target_wavelength),
     )
 
+def delete_cf(dye_name: str, target_wavelength: int) -> None:
+    execute(
+        """
+        DELETE FROM correction_factor_db
+        WHERE dye_name = %s AND target_wavelength = %s
+        """,
+        (dye_name, target_wavelength),
+    )
 
 
 def get_cf_db(conn=None) -> pd.DataFrame:
