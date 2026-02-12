@@ -1439,15 +1439,6 @@ def main():
             eps_df["name"].dropna().unique().tolist()
         )
 
-
-        # unit 정의
-        CONC_TO_uM = {
-        "M": 1e6,
-        "mM": 1e3,
-        "µM": 1,
-        "nM": 1e-3
-    }
-
         st.subheader("Labeling Ratio (A = ε·c·l, l = 1 cm)")
         st.caption(
             "시약 이름을 입력하고 enter를 치면 DB에 저장된 정보가 로딩됩니다. DB에 없는 시약은 값을 직접 입력해주세요."
@@ -1882,68 +1873,129 @@ def main():
     
     # ---------------- ε Database ----------------
     if e_page == "Epsilon DB":
+
         st.subheader("Epsilon (ε) Database")
-        st.caption(
-            "UV–Vis extinction coefficients used for labeling efficiency calculation. "
-            "Values are reused across experiments."
-        )
-        # ---- CF table ----
+
+        eps_df = cached_eps_db()
         cf_df = cached_cf_db()
 
-        if not cf_df.empty:
-            st.markdown("### Correction Factors (CF)")
-            st.dataframe(
-                cf_df,
-                width='stretch',
-                hide_index=True
-            )
-        else:
-            st.caption("No correction factors registered.")
-
-
-        # ---- Load epsilon DB ----
-        eps_df = cached_eps_db()
-        
-        dye_wavelength_options = (
-            eps_df["wavelength"]
-            .dropna()
-            .astype(int)
-            .unique()
-            .tolist()
+        # 항상 먼저 정의 (스코프 에러 방지)
+        eps_name_options = (
+            eps_df["name"].dropna().unique().tolist()
+            if not eps_df.empty else []
         )
 
-        # fallback
-        if not dye_wavelength_options:
-            dye_wavelength_options = [488, 550, 646, 650]
-
+        st.markdown("### Current ε values")
         if eps_df.empty:
-            st.info("ε database is empty. Please add values below.")
+            st.info("ε database is empty.")
         else:
-            st.markdown("### Current ε values")
             st.dataframe(
                 eps_df.sort_values(["name", "wavelength"]),
-                width='stretch',
+                width="stretch",
                 hide_index=True
             )
 
         st.divider()
 
-        # ---- Add / Update ε ----
-        st.markdown("### Add / Update ε value")
-        st.caption(
-            "Same (name, wavelength) will be overwritten. "
-            "Deletion is intentionally disabled to prevent accidents."
-        )
-        mode = st.radio(
-            "Mode",
-            ["Add / Update", "Delete"],
+        # ======================================================
+        # ε MODE
+        # ======================================================
+        st.markdown("## ε Management")
+
+        eps_mode = st.radio(
+            "ε Mode",
+            ["Add", "Update", "Delete"],
             horizontal=True,
-            key="eps_mode"
+            key="eps_mode_new"
         )
-        if mode == "Delete":
+
+        # ---------------- ADD ----------------
+        if eps_mode == "Add":
+
+            c1, c2, c3 = st.columns(3)
+
+            with c1:
+                eps_name = st.text_input("Name *", key="eps_add_name")
+
+            with c2:
+                eps_wavelength = st.number_input(
+                    "Wavelength (nm) *",
+                    min_value=200,
+                    max_value=800,
+                    step=1,
+                    value=650,
+                    key="eps_add_wave"
+                )
+
+            with c3:
+                eps_value = st.number_input(
+                    "ε (M⁻¹·cm⁻¹) *",
+                    min_value=0.0,
+                    step=1000.0,
+                    key="eps_add_val"
+                )
+
+            if st.button("Add ε"):
+                if not eps_name.strip():
+                    st.error("Name is required.")
+                elif eps_value <= 0:
+                    st.error("ε must be greater than 0.")
+                else:
+                    upsert_epsilon(
+                        conn,
+                        name=eps_name.strip(),
+                        wavelength=int(eps_wavelength),
+                        epsilon=float(eps_value),
+                    )
+                    cached_eps_db.clear()
+                    st.success("ε added.")
+                    st.rerun()
+
+        # ---------------- UPDATE ----------------
+        elif eps_mode == "Update":
 
             if eps_df.empty:
-                st.info("No ε values to delete.")
+                st.info("No ε entries available.")
+            else:
+                eps_df_display = eps_df.copy()
+                eps_df_display["label"] = (
+                    eps_df_display["name"]
+                    + " @ "
+                    + eps_df_display["wavelength"].astype(str)
+                    + " nm"
+                )
+
+                selected = st.selectbox(
+                    "Select ε entry",
+                    eps_df_display["label"]
+                )
+
+                row = eps_df_display[
+                    eps_df_display["label"] == selected
+                ].iloc[0]
+
+                new_value = st.number_input(
+                    "New ε value",
+                    min_value=0.0,
+                    value=float(row["epsilon"]),
+                    step=1000.0
+                )
+
+                if st.button("Update ε"):
+                    upsert_epsilon(
+                        conn,
+                        name=row["name"],
+                        wavelength=int(row["wavelength"]),
+                        epsilon=float(new_value),
+                    )
+                    cached_eps_db.clear()
+                    st.success("ε updated.")
+                    st.rerun()
+
+        # ---------------- DELETE ----------------
+        else:
+            if eps_df.empty:
+                st.info("No ε entries available.")
             else:
                 eps_df_display = eps_df.copy()
                 eps_df_display["label"] = (
@@ -1955,7 +2007,7 @@ def main():
 
                 selected = st.selectbox(
                     "Select ε entry to delete",
-                    eps_df_display["label"].tolist()
+                    eps_df_display["label"]
                 )
 
                 row = eps_df_display[
@@ -1964,156 +2016,144 @@ def main():
 
                 st.warning("This action cannot be undone.")
 
-                if st.button("Delete ε value"):
+                if st.button("Delete ε"):
                     delete_epsilon(
                         row["name"],
                         int(row["wavelength"])
                     )
                     cached_eps_db.clear()
-                    st.success("ε value deleted.")
+                    st.success("ε deleted.")
                     st.rerun()
-        if mode == "Add / Update":
 
-            c1, c2, c3, c4, c5 = st.columns([2, 1, 2, 2, 3])
+        st.divider()
 
-            # ε DB에서 name 목록
-            eps_name_options = (
-                eps_df["name"]
-                .dropna()
-                .unique()
-                .tolist()
-            )
+        # ======================================================
+        # CF MODE
+        # ======================================================
+        st.markdown("## Correction Factor (CF) Management")
+
+        cf_mode = st.radio(
+            "CF Mode",
+            ["Add", "Update", "Delete"],
+            horizontal=True,
+            key="cf_mode_new"
+        )
+
+        # ---------------- ADD ----------------
+        if cf_mode == "Add":
+
+            c1, c2, c3 = st.columns(3)
 
             with c1:
-                eps_name = st.selectbox(
-                    "Name *",
-                    options=eps_name_options,
-                    index=None,
-                    placeholder="Select existing or type new",
-                    accept_new_options=True,
-                    key="eps_name"
-                )
-                
-            if eps_name:
-                eps_wavelength_options = (
-                    eps_df.loc[eps_df["name"] == eps_name, "wavelength"]
-                    .dropna()
-                    .astype(int)
-                    .unique()
-                    .tolist()
-                )
-            else:
-                eps_wavelength_options = []
+                cf_dye = st.text_input("Dye name *", key="cf_add_name")
 
             with c2:
-                if eps_wavelength_options:
-                    eps_wavelength = st.selectbox(
-                        "Wavelength (nm) *",
-                        options=eps_wavelength_options,
-                        index=0,
-                        help="Loaded from ε DB"
-                    )
-                else:
-                    eps_wavelength = st.number_input(
-                        "Wavelength (nm) *",
-                        min_value=200,
-                        max_value=800,
-                        step=1,
-                        value=650
-                    )
-
-
-            eps_existing = None
-            if eps_name and eps_wavelength:
-                eps_existing = get_epsilon_value(
-                    conn,
-                    eps_name,
-                    int(eps_wavelength)
+                cf_wave = st.selectbox(
+                    "Target wavelength (nm) *",
+                    [260, 280],
+                    key="cf_add_wave"
                 )
 
             with c3:
-                eps_value = st.number_input(
-                    "ε (M⁻¹·cm⁻¹) *",
+                cf_val = st.number_input(
+                    "CF value *",
                     min_value=0.0,
-                    step=1000.0,
-                    format="%.0f",
-                    value=float(eps_existing["epsilon"]) if eps_existing else 0.0
+                    step=0.001,
+                    key="cf_add_val"
                 )
 
-            with c5:
-                eps_note = st.text_input(
-                    "Note (optional)",
-                    placeholder="literature / supplier / estimate"
-                )
-        # --- CF 관리 전용 입력 ---
-       
-        # app.py (Epsilon DB 섹션의 "Spectral correction factor (CF)" 부분)
+            if st.button("Add CF"):
+                if not cf_dye.strip():
+                    st.error("Dye name is required.")
+                elif cf_val <= 0:
+                    st.error("CF must be greater than 0.")
+                else:
+                    upsert_cf(
+                        conn,
+                        dye_name=cf_dye.strip(),
+                        target_wavelength=cf_wave,
+                        factor=float(cf_val),
+                        note="manual entry"
+                    )
+                    cached_cf_db.clear()
+                    st.success("CF added.")
+                    st.rerun()
 
-        st.markdown("### Spectral correction factor (CF)")
+        # ---------------- UPDATE ----------------
+        elif cf_mode == "Update":
 
-        # eps DB의 name 목록을 토글(셀렉트)로
-        cf_dye_name = st.selectbox(
-            "Dye name for CF",
-            options=eps_name_options,
-            index=None,
-            placeholder="Select dye (or type new)",
-            accept_new_options=True,
-            key="cf_dye_name",
-        )
-
-        cf_target_wavelength = st.selectbox(
-            "Target wavelength for CF (nm)",
-            [260, 280],
-            index=0,
-            key="cf_target_wavelength",
-        )
-
-        # 초기값 반드시 선언 (안 그러면 cf_val referenced before assignment 터짐)
-        cf_val = None
-        if cf_dye_name:
-            cf_val = lookup_cf(cf_df, cf_dye_name.strip(), cf_target_wavelength)
-
-        cf_input = st.number_input(
-            f"CF: {cf_dye_name or 'dye'} → {cf_target_wavelength} nm",
-            min_value=0.0,
-            step=0.001,
-            value=float(cf_val) if cf_val is not None else 0.0,
-            help="A_target_corr = A_target - CF × A_dye"
-        )
-
-        if st.button("Save CF"):
-            if not cf_dye_name or not cf_dye_name.strip():
-                st.error("Dye name is required for CF.")
+            if cf_df.empty:
+                st.info("No CF entries available.")
             else:
-                upsert_cf(
-                    conn,
-                    dye_name=cf_dye_name.strip(),
-                    target_wavelength=cf_target_wavelength,
-                    factor=float(cf_input),
-                    note="UV cross-absorbance correction"
+                cf_df_display = cf_df.copy()
+                cf_df_display["label"] = (
+                    cf_df_display["dye_name"]
+                    + " → "
+                    + cf_df_display["target_wavelength"].astype(str)
+                    + " nm"
                 )
-                st.success("CF saved.")
-                cached_cf_db.clear()
-                cached_eps_db.clear()
 
-        # ---- Save button ----
-        if st.button("💾 Save ε/CF values", width='stretch'):
-            if not eps_name.strip():
-                st.error("Name is required.")
-            elif eps_value <= 0:
-                st.error("ε value must be greater than 0.")
+                selected = st.selectbox(
+                    "Select CF entry",
+                    cf_df_display["label"]
+                )
+
+                row = cf_df_display[
+                    cf_df_display["label"] == selected
+                ].iloc[0]
+
+                new_val = st.number_input(
+                    "New CF value",
+                    min_value=0.0,
+                    value=float(row["factor"]),
+                    step=0.001
+                )
+
+                if st.button("Update CF"):
+                    upsert_cf(
+                        conn,
+                        dye_name=row["dye_name"],
+                        target_wavelength=int(row["target_wavelength"]),
+                        factor=float(new_val),
+                        note="updated"
+                    )
+                    cached_cf_db.clear()
+                    st.success("CF updated.")
+                    st.rerun()
+
+        # ---------------- DELETE ----------------
+        else:
+            if cf_df.empty:
+                st.info("No CF entries available.")
             else:
-                upsert_epsilon(
-                    conn,
-                    name=eps_name.strip(),
-                    wavelength=int(eps_wavelength),
-                    epsilon=float(eps_value),
-                    note=eps_note.strip() or None,
+                cf_df_display = cf_df.copy()
+                cf_df_display["label"] = (
+                    cf_df_display["dye_name"]
+                    + " → "
+                    + cf_df_display["target_wavelength"].astype(str)
+                    + " nm"
                 )
-                cached_eps_db.clear()
-                st.success(
-                    f"ε saved: {eps_name.strip()} @ {int(eps_wavelength)} nm"
+
+                selected = st.selectbox(
+                    "Select CF entry to delete",
+                    cf_df_display["label"]
                 )
+
+                row = cf_df_display[
+                    cf_df_display["label"] == selected
+                ].iloc[0]
+
+                st.warning("This action cannot be undone.")
+
+                if st.button("Delete CF"):
+                    delete_cf(
+                        row["dye_name"],
+                        int(row["target_wavelength"])
+                    )
+                    cached_cf_db.clear()
+                    st.success("CF deleted.")
+                    st.rerun()
+
 
 if __name__ == "__main__":
     main()
